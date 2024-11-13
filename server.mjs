@@ -119,25 +119,64 @@ const extractKeywordsFromScript = (script) => {
 
 // Endpoint to merge videos
 app.post('/merge-videos', async (req, res) => {
-    const { script } = req.body;
+    const { script, voiceAssistant } = req.body;
+    const voiceId = voiceAssistant || undefined;
 
-    if (!script) {
-        return res.status(400).json({ error: 'Script is required' });
+    console.log('Merge request received:', { script, voiceId });  // Log request data
+
+    if (!script || !voiceId) {
+        return res.status(400).json({ error: 'Script and Voice ID are required' });
     }
 
     const videoDirectory = path.join(__dirname, 'videos').replace(/\\/g, '/');
     const outputFilePath = path.join(videoDirectory, `output-${uuidv4()}.mp4`).replace(/\\/g, '/');
+    const audioFilePath = path.join(videoDirectory, `voiceover-${uuidv4()}.mp3`).replace(/\\/g, '/');
 
-    //const audioFilePath = path.join(__dirname, 'output.mp3');
-    
     if (!fs.existsSync(videoDirectory)) {
         fs.mkdirSync(videoDirectory, { recursive: true });
     }
 
     const keywords = extractKeywordsFromScript(script);
+    console.log('Keywords extracted from script:', keywords);  // Log extracted keywords
 
     try {
-        // Fetch videos with filter for short duration
+        // Generate Voice-over
+        console.log('Generating voice-over...');
+        const voiceResponse = await axios.post(
+            `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+            {
+                text: script,
+                model_id: 'eleven_monolingual_v1',
+                voice_settings: {
+                    stability: 0.5,
+                    similarity_boost: 0.5,
+                },
+            },
+            {
+                headers: {
+                    'Accept': 'audio/mpeg',
+                    'Content-Type': 'application/json',
+                    'xi-api-key': elevenLabsApiKey,
+                },
+                responseType: 'stream',
+            }
+        );
+
+        const writer = fs.createWriteStream(audioFilePath);
+        voiceResponse.data.pipe(writer);
+
+        await new Promise((resolve, reject) => {
+            writer.on('finish', resolve);
+            writer.on('error', (err) => {
+                console.error('Error during voice-over generation:', err);
+                reject(err);
+            });
+        });
+
+        console.log('Voice-over generated successfully.');
+
+        // Fetch and download videos based on keywords
+        console.log('Fetching and downloading videos...');
         const videoResults = await Promise.all(keywords.slice(0, MAX_VIDEOS).map(async (keyword) => {
             try {
                 const response = await axios.get('https://api.pexels.com/videos/search', {
@@ -162,33 +201,43 @@ app.post('/merge-videos', async (req, res) => {
             return res.status(404).json({ error: 'No suitable videos found for the given script.' });
         }
 
+        console.log('Videos to download:', filteredVideos);  // Log the filtered video URLs
+
         const videoFiles = await Promise.all(filteredVideos.map(async (url, index) => {
             const outputPath = path.join(videoDirectory, `video${index}.mp4`).replace(/\\/g, '/');
+            console.log(`Downloading video ${index + 1}:`, url);  // Log video download start
             await downloadVideo(url, outputPath);
-            console.log(`Downloaded video ${index + 1} to ${outputPath}`);
+            console.log(`Video ${index + 1} downloaded to ${outputPath}`);  // Log successful download
             return outputPath;
         }));
 
-        // FFmpeg command for merging videos with vertical aspect ratio
-        const ffmpegCommand = `ffmpeg ${videoFiles.map(file => `-i "${file}"`).join(' ')} -filter_complex "${videoFiles.map((file, index) => `[${index}:v]scale=1080:1920,setdar=9/16[v${index}];`).join(' ')} ${videoFiles.map((_, index) => `[v${index}]`).join('')}concat=n=${videoFiles.length}:v=1:a=0[outv]" -map "[outv]" -c:v libx264 -pix_fmt yuv420p -y "${outputFilePath}"`;
+        // Log the FFmpeg command being run
+        const ffmpegCommand = `ffmpeg ${videoFiles.map(file => `-i "${file}"`).join(' ')} -i "${audioFilePath}" \
+            -filter_complex "${videoFiles.map((file, index) => `[${index}:v]scale=1080:1920,setdar=9/16[v${index}];`).join(' ')} \
+            ${videoFiles.map((_, index) => `[v${index}]`).join('')}concat=n=${videoFiles.length}:v=1:a=0[outv]" \
+            -map "[outv]" -map ${videoFiles.length}:a -shortest -c:v libx264 -pix_fmt yuv420p -y "${outputFilePath}"`;
 
+        console.log('Running FFmpeg command:', ffmpegCommand);  // Log the FFmpeg command
+
+        // Execute FFmpeg to merge videos and add voice-over
         exec(ffmpegCommand, (error, stdout, stderr) => {
             if (error) {
                 console.error('FFmpeg Error:', error.message);
                 return res.status(500).json({ error: 'FFmpeg error during video merging', details: stderr });
             }
 
-            console.log(`Generated output video at ${outputFilePath}`);
+            console.log('FFmpeg process completed successfully.');
             res.download(outputFilePath, () => {
-                videoFiles.forEach(file => fs.unlink(file, () => {}));
-                fs.unlink(outputFilePath, () => {});
+                // Cleanup files after download
+                [...videoFiles, audioFilePath, outputFilePath].forEach(file => fs.unlink(file, () => {}));
             });
         });
     } catch (error) {
         console.error('Error during video merging process:', error);
-        res.status(500).json({ error: 'Failed to merge videos.', details: error.message });
+        res.status(500).json({ error: 'Failed to merge videos with voice-over.', details: error.message });
     }
 });
+
 
 
 
